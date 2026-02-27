@@ -1,0 +1,2399 @@
+--- /dev/null	2026-02-27 15:03:50
++++ .env.local.example	2026-02-27 14:40:32
+@@ -0,0 +1,23 @@
++# Neo4j
++NEO4J_URI=neo4j+s://xxxx.databases.neo4j.io
++NEO4J_USER=neo4j
++NEO4J_PASSWORD=your_password
++
++# OpenAI
++OPENAI_API_KEY=sk-...
++
++# Tavily
++TAVILY_API_KEY=tvly-...
++
++# Yutori
++YUTORI_API_KEY=...
++YUTORI_BASE_URL=https://api.yutori.ai
++
++# Modulate
++MODULATE_API_KEY=...
++MODULATE_BASE_URL=https://api.modulate.ai
++
++NEXT_PUBLIC_BASE_URL=http://localhost:3000
++# Optional default retrieval mode for entity claims API
++# Values: strict | balanced | broad
++CLAIM_MODE=balanced
+--- /dev/null	2026-02-27 15:03:50
++++ README.md	2026-02-27 15:02:19
+@@ -0,0 +1,41 @@
++# TruthLedger
++
++Hackathon-ready accountability engine for tracking public promises and evidence over time.
++
++## Setup
++
++1. Copy env template:
++   - `cp .env.local.example .env.local`
++2. Fill all API keys and Neo4j credentials in `.env.local`
++3. Install dependencies:
++   - `npm install`
++4. Start app:
++   - `npm run dev`
++5. Optional smoke test for entity route:
++   - `bash scripts/test-entity-route.sh`
++6. Semantic claim validator examples:
++   - `npm run test:real-claims`
++
++## Entity Claims API
++
++`GET /api/entity/:name?topic=&mode=&includeProfileFacts=&broadenClaimTypes=`
++
++- `mode`: `strict | balanced | broad` (default `balanced`)
++- `includeProfileFacts`: `true | false` (default `true`)
++- `broadenClaimTypes`: `true | false` (default `true`)
++- `includePlanned`: `true | false` (default `true`)
++
++Response includes:
++- `entity` profile panel data (`description`, `website`, `hq`, `founded`, `source_label`)
++- `claims[]` with `type`, `confidence`, and evidence array (`url`, `title`, `snippet`)
++- `retrieval` diagnostics (`expanded_queries`, `sources_considered`, `sources_returned`)
++- ambiguity payload (`question`, `options`) when the query is ambiguous
++
++## Demo flow
++
++1. Open `/` and scan an entity (e.g. Tesla)
++2. View dashboard scores and claims
++3. Click `Update Evidence`
++4. Upload a slide/PDF to extract more claims
++5. Upload audio for voice signal analysis
++6. Open `Share Report`
+--- /dev/null	2026-02-27 15:03:50
++++ app/api/entity/[name]/route.ts	2026-02-27 15:03:18
+@@ -0,0 +1,847 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { searchClaims } from '@/lib/tavily';
++import { hasTavilyConfig } from '@/lib/runtime';
++import { getFixtureClaims } from '@/lib/fixtures/entity-claims';
++import type { ApiClaimFixture } from '@/lib/fixtures/types';
++import { extractRealClaimsFromSource } from '@/lib/claim-extraction';
++
++export const dynamic = 'force-dynamic';
++
++type Mode = 'strict' | 'balanced' | 'broad';
++
++type ClaimType = 'implemented' | 'in_progress' | 'planned' | 'failed' | 'metric';
++
++type Evidence = {
++  url: string;
++  title: string;
++  snippet: string;
++  published_at?: string;
++  source_name?: string;
++};
++
++type ApiClaim = {
++  id: string;
++  type: ClaimType;
++  statement: string;
++  category: ClaimType;
++  status: 'success' | 'partial' | 'ongoing' | 'delayed' | 'cancelled' | 'unknown';
++  text: string;
++  normalized?: {
++    metric?: string;
++    value?: string;
++    unit?: string;
++    date?: string;
++    timeframe?: string;
++    polarity?: 'positive' | 'negative' | 'neutral';
++  };
++  confidence: number;
++  subject: string;
++  action: string;
++  object: string;
++  timeframe?: string;
++  attribution: {
++    speaker?: string;
++    org?: string;
++    role?: string;
++    source_type: 'official' | 'filing' | 'news' | 'interview' | 'analysis' | 'unknown';
++  };
++  evidence: Evidence[];
++  negative: boolean;
++  keywords: string[];
++  extracted_at: string;
++};
++
++type RetrievalSource = { url: string; title: string; snippet: string };
++
++type EntityResponse = {
++  entity: {
++    id: string;
++    name: string;
++    type: 'company' | 'person' | 'thing' | 'unit' | 'unknown';
++    description?: string;
++    website?: string;
++    hq?: string;
++    founded?: string;
++    source_label?: string;
++  };
++  ambiguous?: boolean;
++  question?: string;
++  options?: Array<{
++    id: string;
++    name: string;
++    type: 'company' | 'person' | 'thing' | 'unknown';
++    disambiguation_hint?: string;
++    resolveTo?: string;
++    title?: string;
++    kind?: string;
++    hint?: string;
++  }>;
++  claims: ApiClaim[];
++  retrieval: {
++    query: string;
++    expanded_queries: string[];
++    sources_considered: number;
++    sources_returned: RetrievalSource[];
++    mode: Mode;
++  };
++  message?: string;
++  query?: string;
++  entityCandidate?: string;
++  topic?: string;
++  includePlannedCommitments?: boolean;
++  normalized?: string;
++  resolvedEntity?: { title: string; url?: string; kind?: string };
++  updatedAt?: string;
++};
++
++type WikiSummary = {
++  type?: string;
++  title?: string;
++  extract?: string;
++  description?: string;
++  wikibase_item?: string;
++  content_urls?: { desktop?: { page?: string } };
++};
++
++type WikidataFacts = {
++  hq?: string;
++  inception?: string;
++  founder?: string;
++  industry?: string;
++  website?: string;
++};
++
++type SourceDoc = {
++  url: string;
++  title: string;
++  snippet: string;
++  text: string;
++  published_at?: string;
++  source_name?: string;
++};
++
++const KNOWN_AMBIGUOUS = new Set(['apple', 'tesla', 'amazon']);
++const CLIMATE_KEYWORDS = ['carbon', 'neutral', 'net zero', 'emission', 'sustainability', 'climate', 'esg'];
++
++function normalizeName(raw: string) {
++  return raw.trim().toLowerCase().replace(/\s+/g, ' ');
++}
++
++function toMode(input: string | null): Mode {
++  if (input === 'strict' || input === 'broad') return input;
++  return 'balanced';
++}
++
++function parseBool(input: string | null, fallback = true) {
++  if (input === null) return fallback;
++  return input === '1' || input.toLowerCase() === 'true';
++}
++
++function parseQueryInput(raw: string, forcedTopic?: string) {
++  const cleaned = raw.replace(/\s+/g, ' ').trim();
++  if (!cleaned) return { entityCandidate: '', topic: '' };
++  if (forcedTopic !== undefined) {
++    return { entityCandidate: cleaned, topic: forcedTopic.replace(/\s+/g, ' ').trim() };
++  }
++  if (/[(),]/.test(cleaned) || /\b(inc\.?|corp\.?|ltd\.?|plc|company|group|motors|records)\b/i.test(cleaned)) {
++    return { entityCandidate: cleaned, topic: '' };
++  }
++  const parts = cleaned.split(' ');
++  if (parts.length === 1) return { entityCandidate: cleaned, topic: '' };
++  return { entityCandidate: parts[0], topic: parts.slice(1).join(' ').trim() };
++}
++
++function hasClimateTopic(topic: string) {
++  const lower = topic.toLowerCase();
++  return CLIMATE_KEYWORDS.some((k) => lower.includes(k));
++}
++
++function looksResolvedEntity(value: string) {
++  return /\(|inc\.?|corp\.?|company|motors|group|ltd\.?|plc|records/i.test(value);
++}
++
++function limitWords(text: string, maxWords = 25) {
++  const words = text.replace(/\s+/g, ' ').trim().split(' ');
++  if (words.length <= maxWords) return words.join(' ');
++  return `${words.slice(0, maxWords).join(' ')}...`;
++}
++
++function splitSentences(input: string) {
++  return input
++    .replace(/\s+/g, ' ')
++    .split(/(?<=[.!?])\s+/)
++    .map((s) => s.trim())
++    .filter(Boolean);
++}
++
++function isDisambiguation(summary: WikiSummary) {
++  const extract = (summary.extract || '').toLowerCase();
++  return (
++    summary.type === 'disambiguation' ||
++    /may refer to:|topics referred to by the same term|most commonly refers to/.test(extract)
++  );
++}
++
++function inferEntityType(summary?: WikiSummary): EntityResponse['entity']['type'] {
++  const text = `${summary?.title || ''} ${summary?.description || ''}`.toLowerCase();
++  if (/company|inc\.?|corporation|automotive|software|technology|manufacturer/.test(text)) return 'company';
++  if (/person|scientist|engineer|actor|politician|founder|ceo/.test(text)) return 'person';
++  if (/unit|measure|symbol/.test(text)) return 'unit';
++  if (text) return 'thing';
++  return 'unknown';
++}
++
++function inferOptionType(name: string, hint?: string): 'company' | 'person' | 'thing' | 'unknown' {
++  const text = `${name} ${hint || ''}`.toLowerCase();
++  if (/inc\.?|company|corporation|technology|automotive|manufacturer|records/.test(text)) return 'company';
++  if (/person|inventor|engineer|founder|actor|politician/.test(text)) return 'person';
++  if (/fruit|unit|river|species|album/.test(text)) return 'thing';
++  return 'unknown';
++}
++
++function topicMatches(text: string, topic: string) {
++  if (!topic.trim()) return true;
++  const lower = text.toLowerCase();
++  const tokens = topic
++    .toLowerCase()
++    .split(/\s+/)
++    .filter((t) => t.length > 2 && !['the', 'and', 'for', 'with', 'from'].includes(t));
++  if (!tokens.length) return true;
++  return tokens.some((t) => lower.includes(t));
++}
++
++function buildExpandedQueries(entity: string, topic: string, mode: Mode) {
++  const base = [
++    `${entity} announced`,
++    `${entity} press release`,
++    `${entity} report`,
++    `${entity} earnings call transcript`,
++    `${entity} guidance`,
++    `${entity} lawsuit settlement`,
++    `${entity} data breach`,
++    `${entity} outage`,
++    `${entity} sustainability report net zero`,
++    `${entity} carbon neutral target`,
++    `${entity} launched`,
++    `${entity} rolled out`,
++    `${entity} reported`,
++    `${entity} according to`,
++    `${entity} CEO said`,
++    `${entity} compliance statement`,
++    `${entity} incident response`,
++    `${entity} quarterly results`
++  ];
++
++  const topicQueries = topic
++    ? [
++        `${entity} ${topic}`,
++        `${entity} ${topic} target`,
++        `${entity} ${topic} progress`,
++        `${entity} ${topic} report`,
++        `${entity} ${topic} announcement`
++      ]
++    : [];
++
++  const all = Array.from(new Set([...topicQueries, ...base]));
++  const cap = mode === 'strict' ? 6 : mode === 'balanced' ? 12 : 18;
++  return all.slice(0, cap);
++}
++
++async function fetchWikiSummary(title: string): Promise<WikiSummary | null> {
++  const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
++  const response = await fetch(url, { cache: 'no-store' });
++  if (!response.ok) return null;
++  const data = (await response.json()) as WikiSummary;
++  if (!data?.extract && !data?.description) return null;
++  return data;
++}
++
++async function fetchWikidataFacts(itemId?: string): Promise<WikidataFacts> {
++  if (!itemId) return {};
++  const sparql = `
++SELECT
++  (SAMPLE(?hqLabel) AS ?hqLabel)
++  (SAMPLE(?inception) AS ?inception)
++  (SAMPLE(?founderLabel) AS ?founderLabel)
++  (SAMPLE(?industryLabel) AS ?industryLabel)
++  (SAMPLE(?website) AS ?website)
++WHERE {
++  OPTIONAL { wd:${itemId} wdt:P159 ?hq. }
++  OPTIONAL { wd:${itemId} wdt:P571 ?inception. }
++  OPTIONAL { wd:${itemId} wdt:P112 ?founder. }
++  OPTIONAL { wd:${itemId} wdt:P452 ?industry. }
++  OPTIONAL { wd:${itemId} wdt:P856 ?website. }
++  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
++}
++LIMIT 1
++`;
++  const url = `https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`;
++  const response = await fetch(url, {
++    cache: 'no-store',
++    headers: {
++      Accept: 'application/sparql-results+json',
++      'User-Agent': 'TruthLedger/1.0 (http://localhost:3000)'
++    }
++  });
++  if (!response.ok) return {};
++  const json = (await response.json()) as { results?: { bindings?: Array<Record<string, { value?: string }>> } };
++  const row = json.results?.bindings?.[0];
++  if (!row) return {};
++  return {
++    hq: row.hqLabel?.value,
++    inception: row.inception?.value ? row.inception.value.slice(0, 10) : undefined,
++    founder: row.founderLabel?.value,
++    industry: row.industryLabel?.value,
++    website: row.website?.value
++  };
++}
++
++async function fetchAmbiguityOptions(entityCandidate: string, topic: string) {
++  const lower = entityCandidate.toLowerCase();
++  const known: Record<string, Array<{ name: string; type: 'company' | 'person' | 'thing'; hint: string; resolveTo: string }>> = {
++    apple: [
++      { name: 'Apple Inc.', type: 'company', hint: 'Technology company', resolveTo: 'Apple Inc.' },
++      { name: 'Apple (fruit)', type: 'thing', hint: 'Fruit', resolveTo: 'Apple (fruit)' },
++      { name: 'Apple Records', type: 'company', hint: 'Record label', resolveTo: 'Apple Records' }
++    ],
++    tesla: [
++      { name: 'Tesla, Inc.', type: 'company', hint: 'Electric vehicle and energy company', resolveTo: 'Tesla, Inc.' },
++      { name: 'Nikola Tesla', type: 'person', hint: 'Inventor and electrical engineer', resolveTo: 'Nikola Tesla' },
++      { name: 'Tesla (unit)', type: 'thing', hint: 'SI unit of magnetic flux density', resolveTo: 'Tesla (unit)' }
++    ],
++    amazon: [
++      { name: 'Amazon (company)', type: 'company', hint: 'Technology and e-commerce company', resolveTo: 'Amazon (company)' },
++      { name: 'Amazon River', type: 'thing', hint: 'River in South America', resolveTo: 'Amazon River' }
++    ]
++  };
++
++  const collected = new Map<string, { id: string; name: string; type: 'company' | 'person' | 'thing' | 'unknown'; disambiguation_hint?: string; resolveTo: string; title: string; kind: string; hint?: string }>();
++
++  for (const opt of known[lower] || []) {
++    collected.set(opt.resolveTo.toLowerCase(), {
++      id: opt.resolveTo.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
++      name: opt.name,
++      type: opt.type,
++      disambiguation_hint: opt.hint,
++      resolveTo: opt.resolveTo,
++      title: opt.name,
++      kind: opt.type,
++      hint: opt.hint
++    });
++  }
++
++  const openUrl = `https://en.wikipedia.org/w/api.php?action=opensearch&search=${encodeURIComponent(entityCandidate)}&limit=7&namespace=0&format=json`;
++  const openResp = await fetch(openUrl, { cache: 'no-store' });
++  if (openResp.ok) {
++    const data = (await openResp.json()) as [string, string[], string[], string[]];
++    const titles = data?.[1] || [];
++    const descriptions = data?.[2] || [];
++    for (let i = 0; i < titles.length; i++) {
++      const name = titles[i];
++      const hint = descriptions[i] || '';
++      const type = inferOptionType(name, hint);
++      const resolveTo = name;
++      const key = resolveTo.toLowerCase();
++      if (!collected.has(key)) {
++        collected.set(key, {
++          id: key.replace(/[^a-z0-9]+/g, '-'),
++          name,
++          type,
++          disambiguation_hint: hint || undefined,
++          resolveTo,
++          title: name,
++          kind: type,
++          hint: hint || undefined
++        });
++      }
++    }
++  }
++
++  const options = Array.from(collected.values());
++  if (hasClimateTopic(topic)) {
++    options.sort((a, b) => (a.type === 'company' ? 0 : 1) - (b.type === 'company' ? 0 : 1));
++  }
++  return options.slice(0, 7);
++}
++
++async function fetchNewsSources(query: string, limit = 10): Promise<SourceDoc[]> {
++  const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
++  const response = await fetch(rssUrl, { cache: 'no-store' });
++  if (!response.ok) return [];
++  const xml = await response.text();
++  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, limit);
++  const docs: SourceDoc[] = [];
++
++  for (const match of items) {
++    const item = match[1];
++    const title = (item.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/)?.[1] || item.match(/<title>([\s\S]*?)<\/title>/)?.[1] || '')
++      .replace(/&amp;/g, '&')
++      .replace(/&#39;/g, "'")
++      .replace(/&quot;/g, '"')
++      .replace(/\s+/g, ' ')
++      .trim();
++    const url = (item.match(/<link>([\s\S]*?)<\/link>/)?.[1] || '').trim();
++    const description = (item.match(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/)?.[1] || '')
++      .replace(/<[^>]+>/g, ' ')
++      .replace(/&amp;/g, '&')
++      .replace(/&#39;/g, "'")
++      .replace(/&quot;/g, '"')
++      .replace(/\s+/g, ' ')
++      .trim();
++
++    const snippet = limitWords(title || description || '', 25);
++    const text = [title, description].filter(Boolean).join('. ');
++    if (!url || !text) continue;
++
++    docs.push({
++      url,
++      title: title || 'News source',
++      snippet,
++      text,
++      source_name: 'Google News'
++    });
++  }
++
++  return docs;
++}
++
++async function fetchTavilySources(query: string, limit = 8): Promise<SourceDoc[]> {
++  if (!hasTavilyConfig()) return [];
++  const rows = await searchClaims(query, limit);
++  return rows
++    .map((r: any) => {
++      const text = (r.raw_content || r.content || r.snippet || '').replace(/\s+/g, ' ').trim();
++      const title = (r.title || r.url || 'Web source').replace(/\s+/g, ' ').trim();
++      const snippet = limitWords((r.snippet || text || '').replace(/\s+/g, ' '), 25);
++      if (!r.url || !text) return null;
++      return {
++        url: r.url,
++        title,
++        snippet,
++        text,
++        published_at: r.published_date,
++        source_name: 'Tavily'
++      } as SourceDoc;
++    })
++    .filter((d: SourceDoc | null): d is SourceDoc => Boolean(d));
++}
++
++function buildProfileClaims(entityName: string, summary: WikiSummary | null, facts: WikidataFacts, includeProfileFacts: boolean): ApiClaim[] {
++  if (!includeProfileFacts) return [];
++  const extractedAt = new Date().toISOString();
++  const out: ApiClaim[] = [];
++  const sourceUrl = summary?.content_urls?.desktop?.page || (summary?.title ? `https://en.wikipedia.org/wiki/${encodeURIComponent(summary.title)}` : '');
++  const sourceTitle = summary?.title || entityName;
++
++  if (summary?.description) {
++    out.push({
++      id: 'profile-1',
++      type: 'metric',
++      category: 'metric',
++      status: 'unknown',
++      statement: `${sourceTitle} is ${summary.description}.`,
++      text: `${sourceTitle} is ${summary.description}.`,
++      confidence: 0.9,
++      subject: sourceTitle,
++      action: 'is',
++      object: summary.description || '',
++      attribution: { org: sourceTitle, source_type: 'official' },
++      evidence: [{ url: sourceUrl, title: sourceTitle, snippet: limitWords(summary.extract || summary.description, 25), source_name: 'Wikipedia' }],
++      negative: false,
++      keywords: ['profile'],
++      extracted_at: extractedAt
++    });
++  }
++  if (facts.inception) {
++    out.push({
++      id: 'profile-2',
++      type: 'metric',
++      category: 'metric',
++      status: 'unknown',
++      statement: `${sourceTitle} was founded in ${facts.inception}.`,
++      text: `${sourceTitle} was founded in ${facts.inception}.`,
++      confidence: 0.95,
++      subject: sourceTitle,
++      action: 'founded',
++      object: facts.inception,
++      timeframe: facts.inception,
++      attribution: { org: sourceTitle, source_type: 'official' },
++      evidence: [{ url: `https://www.wikidata.org/wiki/${summary?.wikibase_item || ''}`, title: sourceTitle, snippet: limitWords(`Founded: ${facts.inception}`, 25), source_name: 'Wikidata' }],
++      negative: false,
++      keywords: ['founded'],
++      extracted_at: extractedAt,
++      normalized: { date: facts.inception }
++    });
++  }
++  if (facts.hq) {
++    out.push({
++      id: 'profile-3',
++      type: 'metric',
++      category: 'metric',
++      status: 'unknown',
++      statement: `${sourceTitle} is headquartered in ${facts.hq}.`,
++      text: `${sourceTitle} is headquartered in ${facts.hq}.`,
++      confidence: 0.95,
++      subject: sourceTitle,
++      action: 'headquartered',
++      object: facts.hq,
++      attribution: { org: sourceTitle, source_type: 'official' },
++      evidence: [{ url: `https://www.wikidata.org/wiki/${summary?.wikibase_item || ''}`, title: sourceTitle, snippet: limitWords(`Headquarters: ${facts.hq}`, 25), source_name: 'Wikidata' }],
++      negative: false,
++      keywords: ['headquarters'],
++      extracted_at: extractedAt
++    });
++  }
++  if (facts.website) {
++    out.push({
++      id: 'profile-4',
++      type: 'metric',
++      category: 'metric',
++      status: 'unknown',
++      statement: `${sourceTitle}'s official website is ${facts.website}.`,
++      text: `${sourceTitle}'s official website is ${facts.website}.`,
++      confidence: 0.95,
++      subject: sourceTitle,
++      action: 'website',
++      object: facts.website,
++      attribution: { org: sourceTitle, source_type: 'official' },
++      evidence: [{ url: `https://www.wikidata.org/wiki/${summary?.wikibase_item || ''}`, title: sourceTitle, snippet: limitWords(`Website: ${facts.website}`, 25), source_name: 'Wikidata' }],
++      negative: false,
++      keywords: ['website'],
++      extracted_at: extractedAt
++    });
++  }
++
++  return out;
++}
++
++export async function GET(req: NextRequest, { params }: { params: { name: string } }) {
++  const rawInput = decodeURIComponent(params.name || '');
++  const forcedTopic = req.nextUrl.searchParams.get('topic') || undefined;
++  const mode = toMode(req.nextUrl.searchParams.get('mode'));
++  const includeProfileFacts = parseBool(req.nextUrl.searchParams.get('includeProfileFacts'), true);
++  const broadenClaimTypes = parseBool(req.nextUrl.searchParams.get('broadenClaimTypes'), true);
++  const includePlannedCommitments = parseBool(req.nextUrl.searchParams.get('includePlanned'), true);
++
++  const { entityCandidate, topic } = parseQueryInput(rawInput, forcedTopic);
++  const query = `${entityCandidate}${topic ? ` ${topic}` : ''}`.trim();
++  const normalized = normalizeName(entityCandidate);
++  const updatedAt = new Date().toISOString();
++
++  if (!entityCandidate) {
++    return NextResponse.json({ error: 'Missing entity name' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
++  }
++
++  const shouldClarify = KNOWN_AMBIGUOUS.has(normalized) && !looksResolvedEntity(entityCandidate);
++  if (shouldClarify) {
++    const options = await fetchAmbiguityOptions(entityCandidate, topic);
++    const promptA = options[0];
++    const promptB = options[1];
++    const question = promptA && promptB
++      ? `Do you mean ${promptA.name}${promptA.disambiguation_hint ? ` (${promptA.disambiguation_hint})` : ''} or ${promptB.name}${promptB.disambiguation_hint ? ` (${promptB.disambiguation_hint})` : ''}?`
++      : `Do you mean a specific entity for "${entityCandidate}"?`;
++
++    const payload: EntityResponse = {
++      entity: {
++        id: normalized.replace(/[^a-z0-9]+/g, '-') || 'entity',
++        name: entityCandidate,
++        type: 'unknown'
++      },
++      ambiguous: true,
++      question,
++      options,
++      claims: [],
++      retrieval: {
++        query,
++        expanded_queries: [],
++        sources_considered: 0,
++        sources_returned: [],
++        mode
++      },
++      query,
++      entityCandidate,
++      topic,
++      normalized,
++      updatedAt,
++      message: 'Please clarify entity before claim extraction.'
++    };
++
++    return NextResponse.json(payload, { status: 200, headers: { 'Cache-Control': 'no-store' } });
++  }
++
++  const candidates = Array.from(new Set([
++    `${entityCandidate}, Inc.`,
++    `${entityCandidate} Inc.`,
++    `${entityCandidate} (company)`,
++    `${entityCandidate} company`,
++    entityCandidate
++  ]));
++
++  let summary: WikiSummary | null = null;
++  let resolvedTitle = entityCandidate;
++  let sawDisambiguation = false;
++
++  for (const candidate of candidates) {
++    const item = await fetchWikiSummary(candidate);
++    if (!item) continue;
++    if (isDisambiguation(item)) {
++      sawDisambiguation = true;
++      continue;
++    }
++    summary = item;
++    resolvedTitle = item.title || candidate;
++    break;
++  }
++
++  if (!summary && sawDisambiguation) {
++    const options = await fetchAmbiguityOptions(entityCandidate, topic);
++    const payload: EntityResponse = {
++      entity: {
++        id: normalized.replace(/[^a-z0-9]+/g, '-') || 'entity',
++        name: entityCandidate,
++        type: 'unknown'
++      },
++      ambiguous: true,
++      question: `Do you mean one of these ${entityCandidate} entities?`,
++      options,
++      claims: [],
++      retrieval: {
++        query,
++        expanded_queries: [],
++        sources_considered: 0,
++        sources_returned: [],
++        mode
++      },
++      query,
++      entityCandidate,
++      topic,
++      normalized,
++      updatedAt
++    };
++    return NextResponse.json(payload, { status: 200, headers: { 'Cache-Control': 'no-store' } });
++  }
++
++  const facts = summary ? await fetchWikidataFacts(summary.wikibase_item) : {};
++  const profileLabel = summary ? 'Profile source: Wikipedia/Wikidata' : undefined;
++
++  const expandedQueries = buildExpandedQueries(resolvedTitle, topic, mode);
++  const sourceDocs: SourceDoc[] = [];
++
++  if (summary) {
++    sourceDocs.push({
++      url: summary.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(resolvedTitle)}`,
++      title: summary.title || resolvedTitle,
++      snippet: limitWords(summary.extract || summary.description || '', 25),
++      text: `${summary.extract || ''} ${summary.description || ''}`.trim(),
++      source_name: 'Wikipedia'
++    });
++  }
++
++  for (const q of expandedQueries) {
++    const [newsRows, tavilyRows] = await Promise.all([
++      fetchNewsSources(q, mode === 'broad' ? 8 : 5),
++      fetchTavilySources(q, mode === 'broad' ? 6 : 4)
++    ]);
++    sourceDocs.push(...newsRows, ...tavilyRows);
++  }
++
++  const fixtureRows = getFixtureClaims(resolvedTitle, topic);
++  if (!hasTavilyConfig() && fixtureRows.sources.length) {
++    sourceDocs.push(...fixtureRows.sources);
++  }
++
++  const dedupSourceMap = new Map<string, SourceDoc>();
++  for (const row of sourceDocs) {
++    if (!row.url) continue;
++    if (!dedupSourceMap.has(row.url)) dedupSourceMap.set(row.url, row);
++  }
++  const dedupSources = Array.from(dedupSourceMap.values());
++
++  const pass1Sources = dedupSources.slice(0, mode === 'strict' ? 10 : 16);
++  const toApiClaim = (claim: any): ApiClaim => ({
++    id: claim.id,
++    type: claim.category,
++    statement: claim.statement,
++    category: claim.category,
++    status: claim.status,
++    text: claim.statement,
++    normalized: claim.normalized,
++    confidence: claim.confidence,
++    subject: claim.subject,
++    action: claim.action,
++    object: claim.object,
++    timeframe: claim.timeframe,
++    attribution: claim.attribution,
++    evidence: claim.evidence,
++    negative: Boolean(claim.negative),
++    keywords: claim.keywords || [],
++    extracted_at: updatedAt
++  });
++
++  const pass1Claims: ApiClaim[] = pass1Sources.flatMap((source) =>
++    extractRealClaimsFromSource(
++      {
++        entityName: resolvedTitle,
++        entityId: normalizeName(resolvedTitle).replace(/[^a-z0-9]+/g, '-') || 'entity',
++        text: source.text,
++        title: source.title,
++        url: source.url,
++        published_at: source.published_at,
++        source_name: source.source_name
++      },
++      includePlannedCommitments
++    ).map(toApiClaim)
++  );
++
++  let extractedClaims = [...pass1Claims];
++  const minClaimTarget = mode === 'strict' ? 3 : 5;
++  if (extractedClaims.length < minClaimTarget && mode !== 'strict' && broadenClaimTypes) {
++    const pass2Sources = dedupSources.slice(0, mode === 'balanced' ? 28 : 45);
++    const pass2Claims: ApiClaim[] = pass2Sources.flatMap((source) =>
++      extractRealClaimsFromSource(
++        {
++          entityName: resolvedTitle,
++          entityId: normalizeName(resolvedTitle).replace(/[^a-z0-9]+/g, '-') || 'entity',
++          text: source.text,
++          title: source.title,
++          url: source.url,
++          published_at: source.published_at,
++          source_name: source.source_name
++        },
++        includePlannedCommitments
++      ).map(toApiClaim)
++    );
++
++    const dedup = new Map<string, ApiClaim>();
++    for (const claim of [...extractedClaims, ...pass2Claims]) {
++      const key = `${claim.category}:${claim.statement.toLowerCase().replace(/\s+/g, ' ')}`;
++      if (!dedup.has(key)) {
++        dedup.set(key, { ...claim, type: claim.category, text: claim.statement });
++      } else {
++        const prev = dedup.get(key)!;
++        const mergedEvidence = [...prev.evidence];
++        for (const ev of claim.evidence) {
++          if (!mergedEvidence.some((x) => x.url === ev.url)) mergedEvidence.push(ev);
++        }
++        prev.evidence = mergedEvidence;
++        prev.confidence = Math.min(0.98, Math.max(prev.confidence, claim.confidence) + 0.02);
++      }
++    }
++    extractedClaims = Array.from(dedup.values());
++  }
++
++  const allClaims = [...extractedClaims]
++    .filter((c) => c.evidence?.length)
++    .slice(0, mode === 'broad' ? 20 : 14);
++
++  if (!hasTavilyConfig() && fixtureRows.claims.length) {
++    const fixtureClaimMap = new Map(allClaims.map((c) => [c.text.toLowerCase(), c]));
++    for (const fixtureClaim of fixtureRows.claims as ApiClaimFixture[]) {
++      if (!fixtureClaimMap.has(fixtureClaim.text.toLowerCase()) && fixtureClaim.evidence?.length) {
++        allClaims.push({
++          id: `fixture-${allClaims.length + 1}`,
++          type: fixtureClaim.type === 'commitment' ? 'planned' : fixtureClaim.type === 'progress' ? 'in_progress' : 'metric',
++          category: fixtureClaim.type === 'commitment' ? 'planned' : fixtureClaim.type === 'progress' ? 'in_progress' : 'metric',
++          status: fixtureClaim.type === 'commitment' ? 'unknown' : fixtureClaim.type === 'progress' ? 'ongoing' : 'partial',
++          statement: fixtureClaim.text,
++          text: fixtureClaim.text,
++          confidence: 0.7,
++          subject: resolvedTitle,
++          action: 'reported',
++          object: fixtureClaim.text,
++          attribution: { org: resolvedTitle, source_type: 'news' },
++          evidence: fixtureClaim.evidence,
++          negative: false,
++          keywords: ['fixture'],
++          extracted_at: updatedAt
++        });
++      }
++    }
++  }
++
++  const filteredClaims = allClaims.filter((claim) => {
++    if (!includePlannedCommitments && claim.category === 'planned') return false;
++    if (!broadenClaimTypes) return claim.category === 'implemented' || claim.category === 'in_progress' || claim.category === 'failed' || claim.category === 'metric';
++    if (mode === 'strict') return claim.category === 'implemented' || claim.category === 'in_progress' || claim.category === 'failed' || claim.category === 'metric';
++    return true;
++  });
++
++  if (filteredClaims.length === 0) {
++    const emergencyFixture = getFixtureClaims(resolvedTitle, topic);
++    for (const fixtureClaim of emergencyFixture.claims as ApiClaimFixture[]) {
++      if (!fixtureClaim.evidence?.length) continue;
++      filteredClaims.push({
++        id: `fixture-fallback-${filteredClaims.length + 1}`,
++        type: fixtureClaim.type === 'commitment' ? 'planned' : fixtureClaim.type === 'progress' ? 'in_progress' : 'metric',
++        category: fixtureClaim.type === 'commitment' ? 'planned' : fixtureClaim.type === 'progress' ? 'in_progress' : 'metric',
++        status: fixtureClaim.type === 'commitment' ? 'unknown' : fixtureClaim.type === 'progress' ? 'ongoing' : 'partial',
++        statement: fixtureClaim.text,
++        text: fixtureClaim.text,
++        confidence: 0.68,
++        subject: resolvedTitle,
++        action: 'reported',
++        object: fixtureClaim.text,
++        attribution: { org: resolvedTitle, source_type: 'news' },
++        evidence: fixtureClaim.evidence,
++        negative: false,
++        keywords: ['fixture'],
++        extracted_at: updatedAt
++      });
++    }
++  }
++
++  const retrievalSources: RetrievalSource[] = dedupSources.slice(0, 8).map((s) => ({
++    url: s.url,
++    title: s.title,
++    snippet: s.snippet
++  }));
++
++  const entityId = normalizeName(resolvedTitle).replace(/[^a-z0-9]+/g, '-') || 'entity';
++  const entityType = summary ? inferEntityType(summary) : 'unknown';
++
++  const payload: EntityResponse = {
++    entity: {
++      id: entityId,
++      name: resolvedTitle,
++      type: entityType,
++      description: summary?.description,
++      website: facts.website,
++      hq: facts.hq,
++      founded: facts.inception,
++      source_label: profileLabel
++    },
++    claims: filteredClaims,
++    retrieval: {
++      query,
++      expanded_queries: expandedQueries,
++      sources_considered: dedupSources.length,
++      sources_returned: retrievalSources,
++      mode
++    },
++    message: filteredClaims.length
++      ? undefined
++      : 'No verifiable implementation/progress/failure claims found in current sources',
++      query,
++      entityCandidate,
++      topic,
++      includePlannedCommitments,
++      normalized,
++    resolvedEntity: {
++      title: resolvedTitle,
++      url: summary?.content_urls?.desktop?.page,
++      kind: entityType
++    },
++    updatedAt
++  };
++
++  console.log('[api/entity]', {
++    query,
++    resolvedTitle,
++    ambiguous: false,
++    claimsCount: filteredClaims.length,
++    sources: dedupSources.length,
++    mode
++  });
++
++  return NextResponse.json(payload, { status: 200, headers: { 'Cache-Control': 'no-store' } });
++}
+--- /dev/null	2026-02-27 15:03:50
++++ app/api/scan/route.ts	2026-02-27 15:01:42
+@@ -0,0 +1,121 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { runQuery } from '@/lib/neo4j';
++import { discoverSourcesForEntity } from '@/lib/tavily';
++import { scrapeUrl } from '@/lib/yutori';
++import { extractClaimsFromText } from '@/lib/openai';
++import { calculateReliabilityScore, calculateOverpromiseIndex } from '@/lib/scoring';
++import { v4 as uuidv4 } from 'uuid';
++import { inMockMode } from '@/lib/runtime';
++import { scanEntity } from '@/lib/mock-store';
++import { extractRealClaimsFromSource } from '@/lib/claim-extraction';
++
++export const dynamic = 'force-dynamic';
++
++export async function POST(req: NextRequest) {
++  const { entityName, entityType, ticker } = await req.json();
++
++  if (inMockMode()) {
++    return NextResponse.json(scanEntity(entityName, entityType, ticker));
++  }
++
++  const entityId = uuidv4();
++  const label = entityType === 'company' ? 'Company' : 'Person';
++
++  await runQuery(
++    `MERGE (e:${label} {name: $name})
++     ON CREATE SET e.id = $id, e.ticker = $ticker, e.reliabilityScore = 50,
++                   e.overpromiseIndex = 'Unknown', e.createdAt = datetime(), e.updatedAt = datetime()
++     ON MATCH SET e.updatedAt = datetime()
++     RETURN e`,
++    { name: entityName, id: entityId, ticker: ticker || '' }
++  );
++
++  const urls = await discoverSourcesForEntity(entityName, entityType);
++  const allClaims: any[] = [];
++  const errors: string[] = [];
++
++  for (const url of urls.slice(0, 10)) {
++    try {
++      const { text } = await scrapeUrl(url);
++      if (!text || text.length < 100) continue;
++      const extracted = extractRealClaimsFromSource(
++        {
++          entityName,
++          entityId,
++          text,
++          title: url,
++          url,
++          published_at: new Date().toISOString(),
++          source_name: 'web'
++        },
++        true
++      );
++      if (extracted.length > 0) {
++        allClaims.push(
++          ...extracted.map((c) => ({
++            text: c.statement,
++            category: c.category === 'implemented' || c.category === 'in_progress' ? 'Product' : c.category === 'metric' ? 'Financial' : c.category === 'failed' ? 'Legal' : 'Other',
++            metric: c.action,
++            target: c.object,
++            deadline: c.timeframe || 'Unspecified',
++            certainty: c.category === 'planned' ? 'Aspirational' : 'Definitive',
++            sourceUrl: url,
++            sourceDate: new Date().toISOString()
++          }))
++        );
++      } else {
++        const claims = await extractClaimsFromText(text, url, new Date().toISOString());
++        allClaims.push(...claims);
++      }
++    } catch {
++      errors.push(`Failed: ${url}`);
++    }
++  }
++
++  for (const claim of allClaims) {
++    const claimId = uuidv4();
++    await runQuery(
++      `MATCH (e:${label} {name: $entityName})
++       CREATE (c:Claim {
++         id: $id, text: $text, category: $category, metric: $metric,
++         target: $target, deadline: $deadline, certainty: $certainty,
++         status: 'Unknown', sourceType: 'web', sourceUrl: $sourceUrl,
++         sourceDate: $sourceDate, createdAt: datetime(), updatedAt: datetime()
++       })
++       CREATE (e)-[:HAS_CLAIM]->(c)`,
++      {
++        entityName,
++        id: claimId,
++        text: claim.text || '',
++        category: claim.category || 'Other',
++        metric: claim.metric || '',
++        target: claim.target || '',
++        deadline: claim.deadline || 'Unspecified',
++        certainty: claim.certainty || 'Aspirational',
++        sourceUrl: claim.sourceUrl || '',
++        sourceDate: claim.sourceDate || new Date().toISOString(),
++      }
++    );
++  }
++
++  const claimRows = await runQuery(`MATCH (e:${label} {name: $entityName})-[:HAS_CLAIM]->(c:Claim) RETURN c`, { entityName });
++  const claims = claimRows.map((r: any) => r.c);
++  const reliabilityScore = calculateReliabilityScore(claims);
++  const overpromiseIndex = calculateOverpromiseIndex(claims);
++
++  await runQuery(
++    `MATCH (e:${label} {name: $entityName})
++     SET e.reliabilityScore = $score, e.overpromiseIndex = $index, e.updatedAt = datetime()`,
++    { entityName, score: reliabilityScore, index: overpromiseIndex }
++  );
++
++  return NextResponse.json({
++    success: true,
++    entityName,
++    claimsFound: allClaims.length,
++    urlsScanned: urls.length,
++    reliabilityScore,
++    overpromiseIndex,
++    errors,
++  });
++}
+--- /dev/null	2026-02-27 15:03:50
++++ app/dashboard/[entityId]/page.tsx	2026-02-27 15:02:34
+@@ -0,0 +1,504 @@
++'use client';
++
++import { useEffect, useRef, useState } from 'react';
++import Link from 'next/link';
++import { useParams, useSearchParams } from 'next/navigation';
++import { VoiceAnalysis } from '@/types';
++import ReliabilityScore from '@/components/ReliabilityScore';
++import OverpromiseIndex from '@/components/OverpromiseIndex';
++import EvidenceFeed from '@/components/EvidenceFeed';
++import VoiceSignalUploader from '@/components/VoiceSignalUploader';
++import KnowledgeGraph from '@/components/KnowledgeGraph';
++import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
++
++type Mode = 'strict' | 'balanced' | 'broad';
++
++type ClaimType =
++  | 'implemented'
++  | 'in_progress'
++  | 'planned'
++  | 'failed'
++  | 'metric';
++
++const MODE_LABELS: Record<Mode, string> = {
++  strict: 'Strict',
++  balanced: 'Balanced',
++  broad: 'Broad'
++};
++
++const TOPIC_SUGGESTIONS = ['carbon neutral', 'net zero target', 'earnings guidance', 'lawsuit settlement', 'outage'];
++
++export default function DashboardPage() {
++  const params = useParams<{ entityId: string }>();
++  const searchParams = useSearchParams();
++  const entityName = decodeURIComponent(params.entityId ?? '');
++
++  const [data, setData] = useState<any>(null);
++  const [resolvedQuery, setResolvedQuery] = useState(entityName);
++  const [currentTopic, setCurrentTopic] = useState((searchParams.get('topic') || '').trim());
++  const [mode, setMode] = useState<Mode>('balanced');
++  const [includeProfileFacts, setIncludeProfileFacts] = useState(true);
++  const [broadenClaimTypes, setBroadenClaimTypes] = useState(true);
++  const [includePlannedCommitments, setIncludePlannedCommitments] = useState(true);
++  const [selectedTypes, setSelectedTypes] = useState<Set<ClaimType>>(new Set());
++  const [ambiguousOptions, setAmbiguousOptions] = useState<Array<{ id: string; name?: string; type?: string; disambiguation_hint?: string; resolveTo?: string; title?: string; kind?: string; hint?: string }>>([]);
++  const [ambiguityQuestion, setAmbiguityQuestion] = useState('');
++  const [expandedClaims, setExpandedClaims] = useState<Record<string, boolean>>({});
++  const [loading, setLoading] = useState(true);
++  const [apiStatus, setApiStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
++  const [updatedAt, setUpdatedAt] = useState<string>('');
++  const [errorMessage, setErrorMessage] = useState<string>('');
++  const [activeTab, setActiveTab] = useState<'claims' | 'evidence' | 'graph' | 'voice'>('claims');
++  const [uploadingVoice, setUploadingVoice] = useState(false);
++  const [updatingEvidence, setUpdatingEvidence] = useState(false);
++  const imageInputRef = useRef<HTMLInputElement>(null);
++
++  const loadData = async (args?: { entity?: string; topic?: string; displayQuery?: string }) => {
++    const entity = (args?.entity ?? entityName).trim();
++    const topic = (args?.topic ?? currentTopic).trim();
++    const displayQuery = (args?.displayQuery ?? `${entity}${topic ? ` ${topic}` : ''}`).trim();
++
++    if (!entity) {
++      setData(null);
++      setErrorMessage('Missing entity in URL');
++      setApiStatus('error');
++      setLoading(false);
++      return;
++    }
++
++    setLoading(true);
++    setApiStatus('loading');
++    setErrorMessage('');
++    setData(null);
++    setAmbiguousOptions([]);
++    setAmbiguityQuestion('');
++    setResolvedQuery(displayQuery);
++    setCurrentTopic(topic);
++
++    try {
++      const qp = new URLSearchParams();
++      if (topic) qp.set('topic', topic);
++      qp.set('mode', mode);
++      qp.set('includeProfileFacts', String(includeProfileFacts));
++      qp.set('broadenClaimTypes', String(broadenClaimTypes));
++      qp.set('includePlanned', String(includePlannedCommitments));
++      const url = `/api/entity/${encodeURIComponent(entity)}?${qp.toString()}`;
++
++      console.log('[ui/entity]', { query: entity, topic, mode, includeProfileFacts, broadenClaimTypes, includePlannedCommitments });
++      const res = await fetch(url, { cache: 'no-store' });
++      if (!res.ok) {
++        const text = await res.text().catch(() => '');
++        throw new Error(`HTTP ${res.status}${text ? ` - ${text}` : ''}`);
++      }
++
++      const payload = await res.json();
++      if (payload.ambiguous) {
++        setAmbiguousOptions(payload.options || []);
++        setAmbiguityQuestion(payload.question || 'Do you mean:');
++        setUpdatedAt(payload.updatedAt || '');
++        setErrorMessage(payload.question || 'Ambiguous query. Choose one option below.');
++
++        const preferred = (payload.options || []).find((o: any) => (o.type || o.kind) === 'company') || (payload.options || [])[0];
++        if (preferred) {
++          const previewEntity = preferred.resolveTo || preferred.name || preferred.title;
++          if (previewEntity) {
++            await loadData({
++              entity: previewEntity,
++              topic: payload.topic || topic,
++              displayQuery: `${previewEntity}${payload.topic || topic ? ` ${payload.topic || topic}` : ''}`.trim()
++            });
++            setAmbiguousOptions(payload.options || []);
++            setAmbiguityQuestion(payload.question || 'Do you mean:');
++            return;
++          }
++        }
++
++        setData(payload);
++        setApiStatus('error');
++        return;
++      }
++
++      const claims = (payload.claims || []).map((claim: any, idx: number) => ({
++        id: claim.id || `claim-${idx + 1}`,
++        type: claim.type,
++        text: claim.text,
++        confidence: claim.confidence ?? 0,
++        evidence: (claim.evidence || []).map((ev: any, eIdx: number) => ({
++          id: `${claim.id || idx}-ev-${eIdx}`,
++          text: ev.snippet,
++          summary: ev.snippet,
++          url: ev.url,
++          date: ev.published_at || payload.updatedAt || '',
++          stance: 'Neutral',
++          sourceType: 'web',
++          createdAt: payload.updatedAt || ''
++        })),
++        status: 'Unknown',
++        claim_text: claim.text
++      }));
++
++      const avgConfidence = claims.length
++        ? Math.round((claims.reduce((sum: number, c: any) => sum + Number(c.confidence || 0), 0) / claims.length) * 100)
++        : 50;
++
++      const entityObj = payload.entity || { id: entity.toLowerCase(), name: entity, type: 'unknown' };
++      const merged = {
++        ...payload,
++        entity: {
++          ...entityObj,
++          tags: entityObj?.tags || [],
++          reliabilityScore: avgConfidence,
++          overpromiseIndex: avgConfidence >= 70 ? 'Low' : avgConfidence >= 50 ? 'Medium' : 'High',
++          updatedAt: payload.updatedAt || new Date().toISOString()
++        },
++        claims,
++        voiceAnalyses: payload.voiceAnalyses || [],
++        scoreHistory: payload.scoreHistory || [{ date: (payload.updatedAt || '').slice(0, 10), score: avgConfidence }]
++      };
++
++      setData(merged);
++      setUpdatedAt(payload.updatedAt || '');
++      setExpandedClaims({});
++      setSelectedTypes(new Set(claims.map((c: any) => c.type).filter(Boolean)));
++      setApiStatus('ok');
++      console.log('[ui/entity]', { status: 'ok', claimsCount: claims.length });
++    } catch (err) {
++      const message = err instanceof Error ? err.message : 'Unknown error';
++      console.error('[ui/entity]', err);
++      setErrorMessage(message);
++      setApiStatus('error');
++      setData(null);
++    } finally {
++      setLoading(false);
++    }
++  };
++
++  useEffect(() => {
++    loadData({
++      entity: entityName,
++      topic: (searchParams.get('topic') || '').trim(),
++      displayQuery: `${entityName}${searchParams.get('topic') ? ` ${searchParams.get('topic')}` : ''}`.trim()
++    });
++  }, [entityName]);
++
++  const updateEvidence = async () => {
++    setUpdatingEvidence(true);
++    await fetch('/api/update-evidence', {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ entityName })
++    });
++    await loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++    setUpdatingEvidence(false);
++  };
++
++  const handleVoiceUpload = async (file: File, claimId?: string) => {
++    setUploadingVoice(true);
++    const fd = new FormData();
++    fd.append('audio', file);
++    fd.append('entityName', data?.entity?.name || entityName);
++    if (claimId) fd.append('claimId', claimId);
++    await fetch('/api/analyze-voice', { method: 'POST', body: fd });
++    await loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++    setUploadingVoice(false);
++  };
++
++  const handleImageUpload = async (file: File) => {
++    const fd = new FormData();
++    fd.append('file', file);
++    fd.append('entityName', data?.entity?.name || entityName);
++    await fetch('/api/extract-vision', { method: 'POST', body: fd });
++    await loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++  };
++
++  if (loading) return <div className="min-h-screen grid place-items-center">Loading memory...</div>;
++
++  if (!data) {
++    return (
++      <div className="min-h-screen bg-zinc-950 text-zinc-100 p-8">
++        <div className="mx-auto max-w-3xl space-y-4">
++          <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm">
++            <div>Current query: <span className="font-mono">{resolvedQuery || '(empty)'}</span></div>
++            <div>API status: <span className="font-mono">{apiStatus}</span></div>
++            <div>updatedAt: <span className="font-mono">{updatedAt || '-'}</span></div>
++          </div>
++          {errorMessage ? <div className="rounded-lg border border-red-700 bg-red-950 p-4 text-sm text-red-200">{errorMessage}</div> : null}
++        </div>
++      </div>
++    );
++  }
++
++  const claims = data.claims || [];
++  const filteredClaims = claims.filter((c: any) => (selectedTypes.size ? selectedTypes.has(c.type) : true));
++  const claimTypeCounts: Record<string, number> = claims.reduce((acc: Record<string, number>, c: any) => {
++    acc[c.type || 'unknown'] = (acc[c.type || 'unknown'] || 0) + 1;
++    return acc;
++  }, {});
++
++  const scoreHistory = data.scoreHistory || [];
++  const entity = data.entity || { name: entityName, reliabilityScore: 50, overpromiseIndex: 'Medium' };
++  const voiceAnalyses = data.voiceAnalyses || [];
++  const retrievalSources = data.retrieval?.sources_returned || [];
++
++  const toggleType = (type: ClaimType) => {
++    setSelectedTypes((prev) => {
++      const next = new Set(prev);
++      if (next.has(type)) next.delete(type);
++      else next.add(type);
++      return next;
++    });
++  };
++
++  const triggerSuggestedTopic = (topic: string) => {
++    loadData({ entity: data?.entity?.name || entityName, topic, displayQuery: `${data?.entity?.name || entityName} ${topic}`.trim() });
++  };
++
++  return (
++    <div className="min-h-screen bg-zinc-950 text-zinc-100">
++      <header className="border-b border-zinc-900 px-8 py-4 flex items-center justify-between">
++        <Link href="/" className="text-zinc-500 hover:text-white text-sm">← TruthLedger</Link>
++        <div className="flex gap-3">
++          <button onClick={() => imageInputRef.current?.click()} className="px-4 py-2 text-sm bg-zinc-900 border border-zinc-800 rounded-lg">Upload Slide/PDF</button>
++          <input ref={imageInputRef} type="file" accept="image/*,.pdf" className="hidden" onChange={(e) => e.target.files?.[0] && handleImageUpload(e.target.files[0])} />
++          <button onClick={updateEvidence} disabled={updatingEvidence} className="px-4 py-2 text-sm bg-zinc-900 border border-zinc-800 rounded-lg disabled:opacity-50">{updatingEvidence ? 'Updating...' : 'Update Evidence'}</button>
++          <Link href={`/report/${encodeURIComponent(entityName)}`} className="px-4 py-2 text-sm bg-white text-black font-bold rounded-lg">Share Report</Link>
++        </div>
++      </header>
++
++      <div className="max-w-7xl mx-auto px-8 py-10">
++        <div className="mb-6 rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-xs text-zinc-300">
++          <div>Current query: <span className="font-mono">{resolvedQuery || '(empty)'}</span></div>
++          <div>Mode: <span className="font-mono">{MODE_LABELS[mode]}</span></div>
++          <div>Topic: <span className="font-mono">{currentTopic || '-'}</span></div>
++          <div>API status: <span className="font-mono">{apiStatus}</span></div>
++          <div>updatedAt: <span className="font-mono">{updatedAt || '-'}</span></div>
++          <div>claims returned: <span className="font-mono">{claims.length}</span></div>
++        </div>
++
++        <div className="mb-6 grid grid-cols-1 md:grid-cols-3 gap-3">
++          <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4">
++            <div className="text-xs text-zinc-400 uppercase mb-2">Strictness</div>
++            <div className="flex gap-2">
++              {(['strict', 'balanced', 'broad'] as Mode[]).map((m) => (
++                <button
++                  key={m}
++                  onClick={() => {
++                    setMode(m);
++                    loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++                  }}
++                  className={`px-3 py-1 text-xs rounded border ${mode === m ? 'bg-white text-black border-white' : 'bg-zinc-800 text-zinc-300 border-zinc-700'}`}
++                >
++                  {MODE_LABELS[m]}
++                </button>
++              ))}
++            </div>
++          </div>
++
++          <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm">
++            <label className="flex items-center gap-2">
++              <input
++                type="checkbox"
++                checked={broadenClaimTypes}
++                onChange={(e) => {
++                  setBroadenClaimTypes(e.target.checked);
++                  loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++                }}
++              />
++              Broaden claim types
++            </label>
++            <label className="flex items-center gap-2 mt-2">
++              <input
++                type="checkbox"
++                checked={includeProfileFacts}
++                onChange={(e) => {
++                  setIncludeProfileFacts(e.target.checked);
++                  loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++                }}
++              />
++              Include profile facts
++            </label>
++            <label className="flex items-center gap-2 mt-2">
++              <input
++                type="checkbox"
++                checked={includePlannedCommitments}
++                onChange={(e) => {
++                  setIncludePlannedCommitments(e.target.checked);
++                  loadData({ entity: data?.entity?.name || entityName, topic: currentTopic });
++                }}
++              />
++              Include planned commitments
++            </label>
++          </div>
++
++          <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm">
++            <div className="text-xs text-zinc-400 uppercase mb-2">Entity Profile</div>
++            <div>{entity.name}</div>
++            {entity.description ? <div className="text-zinc-400 mt-1">{entity.description}</div> : null}
++            <div className="mt-2 text-xs text-zinc-400">Founded: {entity.founded || '-'}</div>
++            <div className="text-xs text-zinc-400">HQ: {entity.hq || '-'}</div>
++            <div className="text-xs text-zinc-400 break-all">Website: {entity.website || '-'}</div>
++            <div className="text-xs text-zinc-500 mt-1">{entity.source_label || 'Profile source unavailable'}</div>
++          </div>
++        </div>
++
++        {ambiguousOptions.length > 0 ? (
++          <div className="mb-6 rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm">
++            <div className="mb-2 text-zinc-300">{ambiguityQuestion || 'Do you mean:'}</div>
++            <div className="flex flex-wrap gap-2">
++              {ambiguousOptions.map((option) => {
++                const name = option.name || option.title || '';
++                const resolveTo = option.resolveTo || name;
++                const hint = option.disambiguation_hint || option.hint || '';
++                return (
++                  <button
++                    key={option.id || resolveTo}
++                    onClick={() => loadData({ entity: resolveTo, topic: currentTopic, displayQuery: `${resolveTo}${currentTopic ? ` ${currentTopic}` : ''}`.trim() })}
++                    className="rounded border border-zinc-700 bg-zinc-800 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
++                  >
++                    {name}{hint ? ` (${hint})` : ''}
++                  </button>
++                );
++              })}
++            </div>
++          </div>
++        ) : null}
++
++        {errorMessage ? <div className="mb-6 rounded-lg border border-red-700 bg-red-950 p-4 text-sm text-red-200">{errorMessage}</div> : null}
++
++        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-10">
++          <ReliabilityScore score={entity.reliabilityScore || 0} />
++          <OverpromiseIndex level={entity.overpromiseIndex || 'Low'} />
++          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6"><p className="text-xs text-zinc-500 uppercase tracking-widest mb-2">Total Claims</p><p className="text-5xl font-black">{claims.length}</p></div>
++          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6"><p className="text-xs text-zinc-500 uppercase tracking-widest mb-2">Sources Considered</p><p className="text-5xl font-black">{data.retrieval?.sources_considered || 0}</p></div>
++        </div>
++
++        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-8 h-52">
++          <p className="text-xs text-zinc-500 uppercase tracking-widest mb-2">Reliability Score Trend</p>
++          <ResponsiveContainer width="100%" height="90%">
++            <LineChart data={scoreHistory}>
++              <XAxis dataKey="date" stroke="#71717a" fontSize={11} />
++              <YAxis domain={[0, 100]} stroke="#71717a" fontSize={11} />
++              <Tooltip />
++              <Line type="monotone" dataKey="score" stroke="#34d399" strokeWidth={2} dot={false} />
++            </LineChart>
++          </ResponsiveContainer>
++        </div>
++
++        <div className="mb-6 rounded-lg border border-zinc-800 bg-zinc-900 p-4">
++          <div className="text-xs uppercase tracking-widest text-zinc-500 mb-2">Claim Type Filter</div>
++          <div className="flex flex-wrap gap-2">
++            {Object.entries(claimTypeCounts).map(([type, count]) => {
++              const active = selectedTypes.has(type as ClaimType);
++              return (
++                <button
++                  key={type}
++                  onClick={() => toggleType(type as ClaimType)}
++                  className={`px-3 py-1 text-xs rounded border ${active ? 'bg-white text-black border-white' : 'bg-zinc-800 text-zinc-300 border-zinc-700'}`}
++                >
++                  {type} ({count})
++                </button>
++              );
++            })}
++          </div>
++        </div>
++
++        <div className="flex gap-1 mb-6 bg-zinc-900/50 p-1 rounded-xl w-fit">
++          {(['claims', 'evidence', 'graph', 'voice'] as const).map((tab) => (
++            <button key={tab} onClick={() => setActiveTab(tab)} className={`px-5 py-2 rounded-lg text-sm font-medium capitalize ${activeTab === tab ? 'bg-white text-black' : 'text-zinc-400'}`}>{tab}</button>
++          ))}
++        </div>
++
++        {activeTab === 'claims' && (
++          <div className="space-y-3">
++            {filteredClaims.length === 0 ? (
++              <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-5 text-sm text-zinc-300">
++                <div className="font-medium">{data.message || 'No verifiable implementation/progress/failure claims found in current sources'}</div>
++                <div className="mt-3 text-xs uppercase text-zinc-500">Top Retrieved Sources</div>
++                <div className="mt-2 space-y-2">
++                  {retrievalSources.slice(0, 5).map((s: any, idx: number) => (
++                    <div key={`${s.url}-${idx}`} className="rounded border border-zinc-800 p-3 text-xs">
++                      <a href={s.url} target="_blank" rel="noreferrer" className="underline text-blue-300 break-all">{s.title || s.url}</a>
++                      <div className="mt-1 text-zinc-400">{s.snippet}</div>
++                    </div>
++                  ))}
++                </div>
++                <div className="mt-4 text-xs uppercase text-zinc-500">Try These Searches</div>
++                <div className="mt-2 flex flex-wrap gap-2">
++                  {TOPIC_SUGGESTIONS.map((topic) => (
++                    <button key={topic} className="px-3 py-1 text-xs rounded border border-zinc-700 bg-zinc-800 text-zinc-300" onClick={() => triggerSuggestedTopic(topic)}>
++                      {topic}
++                    </button>
++                  ))}
++                </div>
++              </div>
++            ) : null}
++
++            {filteredClaims.map((claim: any) => (
++              <div key={claim.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 hover:border-zinc-700">
++                <div className="flex items-center justify-between gap-3">
++                  <span className="px-2.5 py-0.5 text-xs font-medium rounded-full border border-zinc-700 bg-zinc-800 text-zinc-200">
++                    {(claim.type === 'implemented' && 'Implemented') ||
++                      (claim.type === 'in_progress' && 'In progress') ||
++                      (claim.type === 'planned' && 'Planned') ||
++                      (claim.type === 'failed' && 'Failed') ||
++                      (claim.type === 'metric' && 'Metric') ||
++                      claim.type ||
++                      'Unknown'}
++                  </span>
++                  <span className="text-xs text-zinc-300">confidence: {(Number(claim.confidence || 0) * 100).toFixed(0)}%</span>
++                </div>
++                <p className="text-white text-lg leading-relaxed mt-3">{claim.text || claim.claim_text}</p>
++                <button
++                  type="button"
++                  className="mt-3 text-xs text-zinc-300 underline"
++                  onClick={() => setExpandedClaims((prev) => ({ ...prev, [claim.id]: !prev[claim.id] }))}
++                >
++                  {expandedClaims[claim.id] ? 'Hide evidence' : 'Show evidence'}
++                </button>
++                {expandedClaims[claim.id] ? (
++                  <div className="mt-3 space-y-2">
++                    {(claim.evidence || []).map((ev: any, idx: number) => (
++                      <div key={`${claim.id}-ev-${idx}`} className="rounded border border-zinc-800 p-3 text-xs text-zinc-300">
++                        <a href={ev.url} target="_blank" rel="noreferrer" className="text-blue-300 underline break-all">
++                          {ev.title || ev.url}
++                        </a>
++                        <div className="mt-1">{ev.summary || ev.text}</div>
++                        {ev.date ? <div className="mt-1 text-zinc-500">{ev.date}</div> : null}
++                      </div>
++                    ))}
++                  </div>
++                ) : null}
++              </div>
++            ))}
++          </div>
++        )}
++
++        {activeTab === 'evidence' && <EvidenceFeed claims={filteredClaims} />}
++        {activeTab === 'graph' && <KnowledgeGraph entityName={entity.name} claims={filteredClaims} />}
++
++        {activeTab === 'voice' && (
++          <div>
++            <VoiceSignalUploader uploading={uploadingVoice} onUpload={handleVoiceUpload} />
++            {voiceAnalyses.map((va: VoiceAnalysis) => (
++              <div key={va.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 mb-4">
++                <div className="flex items-start justify-between mb-4">
++                  <h3 className="font-bold text-lg">Confidence Integrity Signal</h3>
++                  <div className="px-3 py-1 rounded-full text-sm font-bold border border-zinc-700">{va.riskLevel} Risk</div>
++                </div>
++                <p className="text-zinc-300 mb-6 italic">"{va.summary}"</p>
++                <div className="space-y-4">
++                  {va.signals.map((sig, i) => (
++                    <div key={i}>
++                      <div className="flex items-center justify-between mb-1"><span className="text-sm text-zinc-400">{sig.label}</span><span className="text-sm font-mono">{sig.value}</span></div>
++                      <div className="h-2 bg-zinc-800 rounded-full overflow-hidden"><div className="h-full bg-emerald-400" style={{ width: `${sig.value}%` }} /></div>
++                    </div>
++                  ))}
++                </div>
++              </div>
++            ))}
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+--- /dev/null	2026-02-27 15:03:50
++++ app/page.tsx	2026-02-27 14:10:36
+@@ -0,0 +1,47 @@
++'use client';
++
++import { useState } from 'react';
++import { useRouter } from 'next/navigation';
++import SearchBar from '@/components/SearchBar';
++
++export default function HomePage() {
++  const [loading, setLoading] = useState(false);
++  const router = useRouter();
++
++  const handleScan = async (entityName: string, entityType: 'company' | 'person', topic?: string) => {
++    setLoading(true);
++    await fetch('/api/scan', {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ entityName, entityType })
++    });
++    const dashUrl = `/dashboard/${encodeURIComponent(entityName)}${topic ? `?topic=${encodeURIComponent(topic)}` : ''}`;
++    router.push(dashUrl);
++    setLoading(false);
++  };
++
++  return (
++    <main className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center justify-center p-8">
++      <div className="mb-16 text-center">
++        <div className="inline-flex items-center gap-2 mb-4 px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-full text-xs text-zinc-400 tracking-widest uppercase">
++          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
++          Live Memory Engine
++        </div>
++        <h1 className="text-6xl font-black tracking-tight mb-4 bg-gradient-to-br from-white to-zinc-500 bg-clip-text text-transparent">TruthLedger</h1>
++        <p className="text-zinc-400 text-lg max-w-xl mx-auto leading-relaxed">
++          The internet forgets. We don't. Track every public promise, commitment, and claim.
++        </p>
++      </div>
++
++      <SearchBar loading={loading} onScan={handleScan} />
++
++      <div className="mt-12 flex flex-wrap gap-2 justify-center max-w-2xl">
++        {['Tesla', 'OpenAI', 'Volkswagen', 'WeWork', 'Elizabeth Holmes'].map((ex) => (
++          <button key={ex} onClick={() => handleScan(ex, ex === 'Elizabeth Holmes' ? 'person' : 'company')} className="px-3 py-1.5 text-sm text-zinc-500 hover:text-zinc-300 border border-zinc-800 rounded-lg">
++            {ex}
++          </button>
++        ))}
++      </div>
++    </main>
++  );
++}
+--- /dev/null	2026-02-27 15:03:50
++++ components/ClaimCard.tsx	2026-02-27 15:01:29
+@@ -0,0 +1,36 @@
++import { Claim } from '@/types';
++import { getStatusBadgeColor } from '@/lib/scoring';
++
++export default function ClaimCard({ claim }: { claim: Claim }) {
++  const semanticType = (claim as any).type as string | undefined;
++  const semanticStatus = (claim as any).statusSemantic as string | undefined;
++  const badge =
++    (semanticType === 'implemented' && 'Implemented') ||
++    (semanticType === 'in_progress' && 'In progress') ||
++    (semanticType === 'planned' && 'Planned') ||
++    (semanticType === 'failed' && 'Failed') ||
++    (semanticType === 'metric' && 'Metric') ||
++    claim.category;
++
++  return (
++    <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 hover:border-zinc-700 transition-all">
++      <div className="flex items-start justify-between gap-4">
++        <div className="flex-1">
++          <div className="flex items-center gap-2 mb-3 flex-wrap">
++            <span className={`px-2.5 py-0.5 text-xs font-medium rounded-full border ${getStatusBadgeColor(claim.status)}`}>
++              {claim.status}
++            </span>
++            <span className="px-2.5 py-0.5 text-xs font-medium rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700">{badge}</span>
++            <span className="px-2.5 py-0.5 text-xs font-medium rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700">{semanticStatus || claim.certainty}</span>
++          </div>
++          <p className="text-white text-lg leading-relaxed mb-3">"{(claim as any).statement || claim.text}"</p>
++          <div className="flex items-center gap-6 text-sm text-zinc-500">
++            {claim.metric && <span>{claim.metric}: {claim.target}</span>}
++            {claim.deadline && claim.deadline !== 'Unspecified' && <span>By {claim.deadline}</span>}
++            {claim.sourceUrl && <a href={claim.sourceUrl} target="_blank" rel="noopener" className="underline underline-offset-2">Source</a>}
++          </div>
++        </div>
++      </div>
++    </div>
++  );
++}
+--- /dev/null	2026-02-27 15:03:50
++++ components/SearchBar.tsx	2026-02-27 14:10:30
+@@ -0,0 +1,102 @@
++'use client';
++
++import { useState } from 'react';
++
++interface Props {
++  loading: boolean;
++  onScan: (name: string, type: 'company' | 'person', topic?: string) => Promise<void>;
++}
++
++export default function SearchBar({ loading, onScan }: Props) {
++  const [query, setQuery] = useState('');
++  const [entityType, setEntityType] = useState<'company' | 'person'>('company');
++  const [resolving, setResolving] = useState(false);
++  const [question, setQuestion] = useState('');
++  const [topic, setTopic] = useState('');
++  const [options, setOptions] = useState<Array<{ id: string; title: string; kind: string; hint: string; resolveTo: string }>>([]);
++  const [error, setError] = useState('');
++
++  const handleSubmit = async () => {
++    const input = query.trim();
++    if (!input) return;
++    setError('');
++    setQuestion('');
++    setOptions([]);
++    setTopic('');
++    setResolving(true);
++    try {
++      const res = await fetch(`/api/entity/${encodeURIComponent(input)}`, { cache: 'no-store' });
++      const payload = await res.json().catch(() => ({}));
++      if (!res.ok) {
++        throw new Error(`HTTP ${res.status}`);
++      }
++      if (payload?.ambiguous) {
++        setQuestion(payload.question || 'Do you mean:');
++        setOptions(payload.options || []);
++        setTopic(payload.topic || '');
++        return;
++      }
++      await onScan(payload?.resolvedEntity?.title || input, entityType, payload?.topic || '');
++    } catch (err) {
++      setError(err instanceof Error ? err.message : 'Failed to resolve query');
++    } finally {
++      setResolving(false);
++    }
++  };
++
++  return (
++    <div className="w-full max-w-2xl">
++      <div className="flex gap-2 mb-3">
++        {(['company', 'person'] as const).map((t) => (
++          <button
++            key={t}
++            onClick={() => setEntityType(t)}
++            className={`px-4 py-1.5 rounded-full text-sm font-medium ${entityType === t ? 'bg-white text-black' : 'bg-zinc-900 text-zinc-400 border border-zinc-800'}`}
++          >
++            {t}
++          </button>
++        ))}
++      </div>
++      <div className="flex gap-3">
++        <input
++          type="text"
++          value={query}
++          onChange={(e) => {
++            setQuery(e.target.value);
++            setQuestion('');
++            setOptions([]);
++            setError('');
++          }}
++          onKeyDown={(e) => e.key === 'Enter' && query.trim() && handleSubmit()}
++          placeholder={entityType === 'company' ? 'e.g. Tesla, OpenAI...' : 'e.g. Sam Altman...'}
++          className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-4 text-lg placeholder:text-zinc-600"
++        />
++        <button
++          onClick={handleSubmit}
++          disabled={loading || resolving || !query.trim()}
++          className="px-6 py-4 bg-white text-black font-bold rounded-xl disabled:opacity-50"
++        >
++          {loading ? 'Scanning...' : resolving ? 'Resolving...' : 'Scan'}
++        </button>
++      </div>
++      {question && options.length > 0 ? (
++        <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900 p-3 text-sm">
++          <div className="mb-2 text-zinc-300">{question}</div>
++          <div className="flex flex-wrap gap-2">
++            {options.map((option) => (
++              <button
++                key={option.id || option.resolveTo}
++                onClick={() => onScan(option.resolveTo || option.title, entityType, topic)}
++                className="rounded border border-zinc-700 bg-zinc-800 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
++                title={option.hint || option.kind}
++              >
++                {option.title}{option.hint ? ` (${option.hint})` : ''}
++              </button>
++            ))}
++          </div>
++        </div>
++      ) : null}
++      {error ? <div className="mt-3 rounded-lg border border-red-700 bg-red-950 p-3 text-sm text-red-200">{error}</div> : null}
++    </div>
++  );
++}
+--- /dev/null	2026-02-27 15:03:50
++++ lib/claim-extraction.ts	2026-02-27 14:59:01
+@@ -0,0 +1,168 @@
++import { ACTION_LEXICONS, ClaimAttribution, ClaimCategorySemantic, ClaimObject, ClaimStatusSemantic } from '@/lib/types';
++
++export type CandidateSource = {
++  entityName: string;
++  entityId: string;
++  text: string;
++  title: string;
++  url: string;
++  published_at?: string;
++  source_name?: string;
++};
++
++const META_PATTERNS = [
++  /\b(the article claims|people claim|it is claimed|claim that)\b/i,
++  /\b(promises? as a concept|debate about promises|questionable claims)\b/i,
++  /\b(rumor|anonymous source|unconfirmed|speculation)\b/i
++];
++
++const ACTIONS = [
++  ...ACTION_LEXICONS.implemented,
++  ...ACTION_LEXICONS.in_progress,
++  ...ACTION_LEXICONS.planned,
++  ...ACTION_LEXICONS.failed,
++  ...ACTION_LEXICONS.metric
++].sort((a, b) => b.length - a.length);
++
++function escapeRegex(s: string) {
++  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
++
++const ACTION_REGEX = new RegExp(`\\b(${ACTIONS.map(escapeRegex).join('|')})\\b`, 'i');
++
++export function splitSentences(input: string) {
++  return input
++    .replace(/\s+/g, ' ')
++    .split(/(?<=[.!?])\s+/)
++    .map((s) => s.trim())
++    .filter(Boolean);
++}
++
++function hasMetricNumber(text: string) {
++  return /(\$\d|\d+%|\b\d+(\.\d+)?\b)/.test(text);
++}
++
++function extractTimeframe(text: string) {
++  const m = text.match(/\b(Q[1-4]\s*20\d{2}|20\d{2}|by\s+20\d{2}|as of\s+[A-Za-z]+\s+\d{4})\b/i);
++  return m ? m[0] : undefined;
++}
++
++function attributionFromSource(source: CandidateSource, sentence: string): ClaimAttribution {
++  const speakerMatch = sentence.match(/\b([A-Z][a-z]+\s+[A-Z][a-z]+)\s+(said|stated|announced|told)\b/);
++  const domainOfficial = /(investor|ir\.|sec\.gov|annual report|earnings call|press release|about\.)/i.test(`${source.url} ${source.title}`);
++  return {
++    speaker: speakerMatch?.[1],
++    org: source.entityName,
++    role: speakerMatch ? 'Spokesperson' : undefined,
++    source_type: domainOfficial ? (source.url.includes('sec.gov') ? 'filing' : 'official') : 'news'
++  };
++}
++
++function categoryFromAction(action: string): ClaimCategorySemantic {
++  const a = action.toLowerCase();
++  if (ACTION_LEXICONS.implemented.some((v) => v === a)) return 'implemented';
++  if (ACTION_LEXICONS.in_progress.some((v) => v === a)) return 'in_progress';
++  if (ACTION_LEXICONS.planned.some((v) => v === a)) return 'planned';
++  if (ACTION_LEXICONS.failed.some((v) => v === a)) return 'failed';
++  return 'metric';
++}
++
++function statusFromCategory(category: ClaimCategorySemantic): ClaimStatusSemantic {
++  if (category === 'implemented') return 'success';
++  if (category === 'in_progress') return 'ongoing';
++  if (category === 'planned') return 'unknown';
++  if (category === 'failed') return 'delayed';
++  return 'partial';
++}
++
++function normalizeStatement(entityName: string, sentence: string) {
++  const clean = sentence.replace(/\s+/g, ' ').trim();
++  if (clean.toLowerCase().includes(entityName.toLowerCase())) return clean;
++  return `${entityName} ${clean}`.replace(/\s+/g, ' ').trim();
++}
++
++function extractProposition(entityName: string, sentence: string) {
++  const actionMatch = sentence.match(ACTION_REGEX);
++  if (!actionMatch) return null;
++  const action = actionMatch[1];
++  const idx = sentence.toLowerCase().indexOf(action.toLowerCase());
++  if (idx < 0) return null;
++  const before = sentence.slice(0, idx).trim();
++  const after = sentence.slice(idx + action.length).trim().replace(/^[\s:-]+/, '');
++  const subject = before || entityName;
++  const object = after.replace(/[.;]+$/, '').trim();
++  if (!object) return null;
++  return { subject, action, object };
++}
++
++export function scoreClaim(claim: ClaimObject) {
++  let score = 0.35;
++
++  if (claim.category === 'implemented' || claim.category === 'failed' || claim.category === 'metric') score += 0.25;
++  if (claim.timeframe && /20\d{2}|Q[1-4]/i.test(claim.timeframe)) score += 0.15;
++  if (hasMetricNumber(claim.statement)) score += 0.15;
++  if (claim.evidence.some((e) => Boolean(e.quote))) score += 0.1;
++
++  if (META_PATTERNS.some((p) => p.test(claim.statement))) score -= 0.4;
++  if (/\b(claims?|promises?)\b/i.test(claim.statement) && !ACTION_REGEX.test(claim.statement)) score -= 0.3;
++
++  return Math.max(0, Math.min(1, score));
++}
++
++export function isRealClaim(claim: ClaimObject) {
++  const hasAttribution = Boolean(claim.attribution && (claim.attribution.speaker || claim.attribution.org || claim.attribution.source_type === 'official' || claim.attribution.source_type === 'filing'));
++  const hasEvidence = Boolean(claim.evidence?.length && claim.evidence[0].url);
++  const hasVerb = ACTION_REGEX.test(claim.statement) || Boolean(claim.action);
++  const hasObject = Boolean(claim.object && claim.object.trim().length > 1);
++  if (!hasAttribution || !hasEvidence || !hasVerb || !hasObject) return false;
++  return scoreClaim(claim) >= 0.55;
++}
++
++export function extractRealClaimsFromSource(source: CandidateSource, includePlanned = true): ClaimObject[] {
++  const out: ClaimObject[] = [];
++  const sentences = splitSentences(source.text).slice(0, 40);
++
++  for (const sentence of sentences) {
++    if (!sentence.toLowerCase().includes(source.entityName.toLowerCase().split(' ')[0].toLowerCase())) continue;
++    if (!ACTION_REGEX.test(sentence)) continue;
++    const prop = extractProposition(source.entityName, sentence);
++    if (!prop) continue;
++
++    const category = categoryFromAction(prop.action.toLowerCase());
++    if (!includePlanned && category === 'planned') continue;
++
++    const attribution = attributionFromSource(source, sentence);
++    const claim: ClaimObject = {
++      id: `${source.entityId}-${out.length + 1}`,
++      entityId: source.entityId,
++      statement: normalizeStatement(source.entityName, sentence),
++      category,
++      status: statusFromCategory(category),
++      subject: prop.subject,
++      action: prop.action,
++      object: prop.object,
++      timeframe: extractTimeframe(sentence),
++      confidence: 0,
++      attribution,
++      evidence: [
++        {
++          url: source.url,
++          title: source.title,
++          snippet: sentence.split(/\s+/).slice(0, 25).join(' '),
++          quote: sentence,
++          published_at: source.published_at,
++          source_name: source.source_name
++        }
++      ],
++      negative: category === 'failed',
++      keywords: [prop.action]
++    };
++
++    claim.confidence = scoreClaim(claim);
++    if (isRealClaim(claim)) {
++      out.push(claim);
++    }
++  }
++
++  return out;
++}
+--- /dev/null	2026-02-27 15:03:50
++++ lib/fixtures/entity-claims.ts	2026-02-27 14:37:59
+@@ -0,0 +1,68 @@
++import type { ApiClaimFixture, SourceDocFixture } from './types';
++
++const FIXTURES: Record<string, { claims: ApiClaimFixture[]; sources: SourceDocFixture[] }> = {
++  'apple inc.': {
++    claims: [
++      {
++        type: 'commitment',
++        text: 'Apple commits to be carbon neutral across its entire footprint by 2030.',
++        evidence: [
++          {
++            url: 'https://www.apple.com/environment/',
++            title: 'Apple Environment',
++            snippet: 'Apple is committed to being carbon neutral across our entire footprint by 2030.',
++            source_name: 'Apple'
++          }
++        ]
++      }
++    ],
++    sources: [
++      {
++        url: 'https://www.apple.com/environment/',
++        title: 'Apple Environment',
++        snippet: 'Apple is committed to being carbon neutral across our entire footprint by 2030.',
++        text: 'Apple is committed to being carbon neutral across our entire footprint by 2030.',
++        source_name: 'Apple'
++      }
++    ]
++  },
++  'tesla, inc.': {
++    claims: [
++      {
++        type: 'commitment',
++        text: 'Tesla states its mission is to accelerate the world’s transition to sustainable energy.',
++        evidence: [
++          {
++            url: 'https://www.tesla.com/about',
++            title: 'About Tesla',
++            snippet: 'Tesla’s mission is to accelerate the world’s transition to sustainable energy.',
++            source_name: 'Tesla'
++          }
++        ]
++      }
++    ],
++    sources: [
++      {
++        url: 'https://www.tesla.com/about',
++        title: 'About Tesla',
++        snippet: 'Tesla’s mission is to accelerate the world’s transition to sustainable energy.',
++        text: 'Tesla’s mission is to accelerate the world’s transition to sustainable energy.',
++        source_name: 'Tesla'
++      }
++    ]
++  }
++};
++
++function normalize(name: string) {
++  return name.toLowerCase().replace(/\s+/g, ' ').trim();
++}
++
++export function getFixtureClaims(entityName: string, topic: string): { claims: ApiClaimFixture[]; sources: SourceDocFixture[] } {
++  const base = FIXTURES[normalize(entityName)] || { claims: [], sources: [] };
++  if (!topic.trim()) return base;
++
++  const lowerTopic = topic.toLowerCase();
++  const claims = base.claims.filter((c) => c.text.toLowerCase().includes(lowerTopic) || c.evidence.some((e) => e.snippet.toLowerCase().includes(lowerTopic)));
++  const sources = base.sources.filter((s) => s.text.toLowerCase().includes(lowerTopic) || s.snippet.toLowerCase().includes(lowerTopic));
++  return { claims, sources };
++}
+--- /dev/null	2026-02-27 15:03:50
++++ lib/fixtures/types.ts	2026-02-27 14:38:05
+@@ -0,0 +1,28 @@
++export type SourceDocFixture = {
++  url: string;
++  title: string;
++  snippet: string;
++  text: string;
++  published_at?: string;
++  source_name?: string;
++};
++
++export type ApiClaimFixture = {
++  type:
++    | 'commitment'
++    | 'progress'
++    | 'factual_profile'
++    | 'product_feature'
++    | 'financial_metric'
++    | 'legal_regulatory'
++    | 'incident_outage'
++    | 'attribution_quote';
++  text: string;
++  evidence: Array<{
++    url: string;
++    title: string;
++    snippet: string;
++    published_at?: string;
++    source_name?: string;
++  }>;
++};
+--- /dev/null	2026-02-27 15:03:50
++++ lib/prompts/claim-extractor.ts	2026-02-27 14:58:30
+@@ -0,0 +1,20 @@
++export const CLAIM_EXTRACTOR_PROMPT = `
++You are a factual claim extractor for accountability analysis.
++
++Return only REAL, verifiable claims about the target entity.
++A real claim must be an attributed proposition with outcome/status:
++- implemented/shipped/launched
++- in progress/working on
++- planned/targeting (explicit)
++- failed/delayed/cancelled
++- measurable result metric
++
++Do NOT return:
++- meta language about claims/promises
++- commentary or speculation
++- unattributed rumors
++- statements without a concrete subject-action-object proposition
++
++Output JSON array with fields:
++statement, category, status, subject, action, object, timeframe, attribution, evidence quote/snippet.
++`;
+--- /dev/null	2026-02-27 15:03:50
++++ lib/types.ts	2026-02-27 14:58:19
+@@ -0,0 +1,54 @@
++export type ClaimCategorySemantic = 'implemented' | 'in_progress' | 'planned' | 'failed' | 'metric';
++export type ClaimStatusSemantic = 'success' | 'partial' | 'ongoing' | 'delayed' | 'cancelled' | 'unknown';
++
++export type ClaimEvidenceSemantic = {
++  url: string;
++  title: string;
++  snippet: string;
++  quote?: string;
++  published_at?: string;
++  source_name?: string;
++  offset?: number;
++  videoId?: string;
++  start?: number;
++};
++
++export type ClaimAttribution = {
++  speaker?: string;
++  org?: string;
++  role?: string;
++  source_type: 'official' | 'filing' | 'news' | 'interview' | 'analysis' | 'unknown';
++};
++
++export type ClaimObject = {
++  id: string;
++  entityId: string;
++  statement: string;
++  category: ClaimCategorySemantic;
++  status: ClaimStatusSemantic;
++  subject: string;
++  action: string;
++  object: string;
++  timeframe?: string;
++  confidence: number;
++  attribution: ClaimAttribution;
++  evidence: ClaimEvidenceSemantic[];
++  negative: boolean;
++  keywords: string[];
++  normalized?: {
++    metric?: string;
++    value?: string;
++    unit?: string;
++    date?: string;
++    timeframe?: string;
++    polarity?: 'positive' | 'negative' | 'neutral';
++  };
++};
++
++export const ACTION_LEXICONS = {
++  implemented: ['launched', 'shipped', 'released', 'rolled out', 'deployed', 'delivered', 'introduced', 'made available', 'integrated', 'implemented', 'completed', 'achieved', 'built'],
++  in_progress: ['working on', 'developing', 'building', 'testing', 'piloting', 'rolling out', 'preparing', 'iterating', 'training', 'migrating'],
++  planned: ['plans to', 'will', 'aims to', 'targets', 'intends to', 'expects to', 'set to', 'scheduled to'],
++  failed: ['delayed', 'postponed', 'cancelled', 'scrapped', 'paused', 'halted', 'failed to', 'missed', 'abandoned', 'recalled', 'rolled back'],
++  metric: ['reduced', 'increased', 'improved', 'reached', 'hit', 'exceeded', 'missed by', 'grew', 'declined']
++} as const;
+--- /dev/null	2026-02-27 15:03:50
++++ package.json	2026-02-27 15:02:13
+@@ -0,0 +1,40 @@
++{
++  "name": "truthledger",
++  "version": "0.1.0",
++  "private": true,
++  "scripts": {
++    "dev": "next dev -p 3000",
++    "build": "next build",
++    "start": "next start -p 3000",
++    "lint": "next lint",
++    "typecheck": "tsc --noEmit",
++    "test:entity": "bash scripts/test-entity-route.sh",
++    "test:real-claims": "node scripts/test-real-claims.js"
++  },
++  "dependencies": {
++    "@radix-ui/react-slot": "^1.1.2",
++    "class-variance-authority": "^0.7.1",
++    "clsx": "^2.1.1",
++    "neo4j-driver": "^5.19.0",
++    "next": "14.2.0",
++    "openai": "^4.47.1",
++    "pdf-parse": "^1.1.1",
++    "react": "^18",
++    "react-dom": "^18",
++    "reactflow": "^11.11.4",
++    "recharts": "^2.12.7",
++    "tailwind-merge": "^3.3.1",
++    "uuid": "^9.0.0"
++  },
++  "devDependencies": {
++    "@types/node": "^20",
++    "@types/pdf-parse": "^1.1.4",
++    "@types/react": "^18",
++    "@types/react-dom": "^18",
++    "@types/uuid": "^9.0.0",
++    "autoprefixer": "^10.0.1",
++    "postcss": "^8",
++    "tailwindcss": "^3.4.1",
++    "typescript": "^5"
++  }
++}
+--- /dev/null	2026-02-27 15:03:50
++++ scripts/test-entity-route.sh	2026-02-27 14:40:45
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++BASE_URL="${1:-http://localhost:3000}"
++
++echo "[smoke] ambiguous query"
++curl -sS "$BASE_URL/api/entity/apple" | jq '{ambiguous, question, options: (.options | length)}'
++
++echo "[smoke] topic query after disambiguation"
++curl -sS "$BASE_URL/api/entity/Apple%20Inc.?topic=carbon%20neutral&mode=balanced" | jq '{entity: .entity.name, claims: (.claims | length), sources: .retrieval.sources_considered, message}'
++
++echo "[smoke] strict mode"
++curl -sS "$BASE_URL/api/entity/Tesla%2C%20Inc.?mode=strict" | jq '{entity: .entity.name, claims: (.claims | length), mode: .retrieval.mode, message}'
+--- /dev/null	2026-02-27 15:03:50
++++ scripts/test-real-claims.js	2026-02-27 15:02:09
+@@ -0,0 +1,68 @@
++function scoreClaim(claim) {
++  let score = 0.35;
++  if (['implemented', 'failed', 'metric'].includes(claim.category)) score += 0.25;
++  if (claim.timeframe && /20\d{2}|Q[1-4]/i.test(claim.timeframe)) score += 0.15;
++  if (/(\$\d|\d+%|\b\d+(\.\d+)?\b)/.test(claim.statement)) score += 0.15;
++  if (claim.evidence.some((e) => !!e.quote)) score += 0.1;
++  if (/\b(the article claims|people claim|it is claimed|claim that)\b/i.test(claim.statement)) score -= 0.4;
++  if (/\b(claims?|promises?)\b/i.test(claim.statement) && !/\b(launched|shipped|released|working on|plans to|will|delayed|cancelled|increased|reduced|reached)\b/i.test(claim.statement)) score -= 0.3;
++  return Math.max(0, Math.min(1, score));
++}
++
++function isRealClaim(claim) {
++  const hasAttribution = !!(claim.attribution && (claim.attribution.speaker || claim.attribution.org || claim.attribution.source_type === 'official' || claim.attribution.source_type === 'filing'));
++  const hasEvidence = !!(claim.evidence?.length && claim.evidence[0].url);
++  const hasVerb = /\b(launched|shipped|released|rolled out|deployed|delivered|implemented|working on|developing|plans to|will|aims to|targets|delayed|cancelled|failed to|reduced|increased|improved|reached|hit|grew|declined)\b/i.test(claim.statement);
++  const hasObject = !!(claim.object && claim.object.trim().length > 1);
++  if (!hasAttribution || !hasEvidence || !hasVerb || !hasObject) return false;
++  return scoreClaim(claim) >= 0.55;
++}
++
++const tests = [
++  {
++    name: 'promise without deliverable => NO claim',
++    claim: {
++      statement: 'The company promises big things in AI.',
++      category: 'planned',
++      timeframe: '',
++      object: '',
++      attribution: { org: 'ExampleCo', source_type: 'news' },
++      evidence: [{ url: 'https://example.com', quote: '' }]
++    },
++    expected: false
++  },
++  {
++    name: 'Apple shipped X feature in iOS 18 => implemented claim',
++    claim: {
++      statement: 'Apple shipped on-device transcription in iOS 18.',
++      category: 'implemented',
++      timeframe: '2024',
++      object: 'on-device transcription in iOS 18',
++      attribution: { org: 'Apple', source_type: 'official' },
++      evidence: [{ url: 'https://apple.com/newsroom', quote: 'Apple shipped on-device transcription in iOS 18.' }]
++    },
++    expected: true
++  },
++  {
++    name: 'Tesla delayed Cybertruck production targets => failed/delayed claim',
++    claim: {
++      statement: 'Tesla delayed Cybertruck production targets to next year.',
++      category: 'failed',
++      timeframe: 'next year',
++      object: 'Cybertruck production targets',
++      attribution: { org: 'Tesla', source_type: 'news' },
++      evidence: [{ url: 'https://example.com/tesla-delay', quote: 'Tesla delayed Cybertruck production targets to next year.' }]
++    },
++    expected: true
++  }
++];
++
++let ok = 0;
++for (const t of tests) {
++  const result = isRealClaim(t.claim);
++  const pass = result === t.expected;
++  if (pass) ok++;
++  console.log(`${pass ? 'PASS' : 'FAIL'}: ${t.name} -> ${result}`);
++}
++
++if (ok !== tests.length) process.exit(1);
+--- /dev/null	2026-02-27 15:03:50
++++ types/index.ts	2026-02-27 14:40:11
+@@ -0,0 +1,168 @@
++export type ClaimCategory = 'Financial' | 'Product' | 'ESG' | 'Expansion' | 'Personnel' | 'Legal' | 'Other';
++export type ClaimStatus = 'On Track' | 'Behind' | 'Unfulfilled' | 'Contradicted' | 'Fulfilled' | 'Unknown';
++export type ClaimCertainty = 'Definitive' | 'Aspirational' | 'Conditional';
++export type EvidenceStance = 'Supporting' | 'Contradicting' | 'Neutral';
++export type SourceType = 'web' | 'image' | 'pdf' | 'audio';
++export type OverpromiseLevel = 'Low' | 'Medium' | 'High';
++export type RiskLevel = 'Low' | 'Moderate' | 'High';
++
++export interface Company {
++  id: string;
++  name: string;
++  ticker?: string;
++  industry?: string;
++  reliabilityScore: number;
++  overpromiseIndex: OverpromiseLevel;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface Person {
++  id: string;
++  name: string;
++  role?: string;
++  reliabilityScore: number;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface Claim {
++  id: string;
++  text: string;
++  category: ClaimCategory;
++  metric: string;
++  target: string;
++  deadline: string;
++  certainty: ClaimCertainty;
++  status: ClaimStatus;
++  sourceType: SourceType;
++  sourceUrl: string;
++  sourceDate: string;
++  evidence?: Evidence[];
++  voiceAnalysis?: VoiceAnalysis;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface Evidence {
++  id: string;
++  text: string;
++  url: string;
++  date: string;
++  stance: EvidenceStance;
++  summary: string;
++  sourceType: SourceType;
++  createdAt: string;
++}
++
++export interface VoiceAnalysis {
++  id: string;
++  audioUrl?: string;
++  signals: VoiceSignal[];
++  summary: string;
++  confidenceScore: number;
++  riskLevel: RiskLevel;
++  createdAt: string;
++}
++
++export interface VoiceSignal {
++  type: string;
++  label: string;
++  value: number;
++  description: string;
++}
++
++export interface EntityDashboard {
++  entity: Company | Person;
++  entityType: 'company' | 'person';
++  claims: Claim[];
++  reliabilityScore: number;
++  overpromiseIndex: OverpromiseLevel;
++  scoreHistory: { date: string; score: number }[];
++}
++
++export interface ScanRequest {
++  entityName: string;
++  entityType: 'company' | 'person';
++  ticker?: string;
++}
++
++export interface ExtractedClaim {
++  text: string;
++  category: ClaimCategory;
++  metric: string;
++  target: string;
++  deadline: string;
++  certainty: ClaimCertainty;
++  speaker?: string;
++  sourceUrl: string;
++  sourceDate: string;
++}
++
++export type ClaimType =
++  | 'commitment'
++  | 'progress'
++  | 'factual_profile'
++  | 'product_feature'
++  | 'financial_metric'
++  | 'legal_regulatory'
++  | 'incident_outage'
++  | 'attribution_quote';
++
++export type RetrievalMode = 'strict' | 'balanced' | 'broad';
++
++export interface ClaimEvidenceV2 {
++  url: string;
++  title: string;
++  snippet: string;
++  published_at?: string;
++  source_name?: string;
++}
++
++export interface ClaimV2 {
++  id: string;
++  type: ClaimType;
++  text: string;
++  confidence: number;
++  evidence: ClaimEvidenceV2[];
++  extracted_at: string;
++  normalized?: {
++    metric?: string;
++    value?: string;
++    unit?: string;
++    date?: string;
++    timeframe?: string;
++    polarity?: 'positive' | 'negative' | 'neutral';
++  };
++}
++
++export interface EntityClaimsResponse {
++  entity: {
++    id: string;
++    name: string;
++    type: 'company' | 'person' | 'thing' | 'unit' | 'unknown';
++    description?: string;
++    website?: string;
++    hq?: string;
++    founded?: string;
++    source_label?: string;
++  };
++  ambiguous?: boolean;
++  question?: string;
++  options?: Array<{
++    id: string;
++    name: string;
++    type: 'company' | 'person' | 'thing' | 'unknown';
++    disambiguation_hint?: string;
++    resolveTo?: string;
++  }>;
++  claims: ClaimV2[];
++  retrieval: {
++    query: string;
++    expanded_queries: string[];
++    sources_considered: number;
++    sources_returned: Array<{ url: string; title: string; snippet: string }>;
++    mode: RetrievalMode;
++  };
++  message?: string;
++}

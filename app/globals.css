@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 222.2 47.4% 11.2%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 47.4% 11.2%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 47.4% 11.2%;
+    --primary: 214 84% 41%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 94%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 189 85% 93%;
+    --accent-foreground: 198 92% 20%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214.3 31.8% 88%;
+    --input: 214.3 31.8% 88%;
+    --ring: 214 84% 41%;
+    --radius: 0.9rem;
+  }
+
+  .dark {
+    --background: 220 22% 10%;
+    --foreground: 210 40% 98%;
+    --card: 222 22% 13%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 22% 13%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 199 89% 58%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 21% 18%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 21% 16%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 196 100% 14%;
+    --accent-foreground: 189 80% 78%;
+    --destructive: 0 62.8% 45%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 21% 22%;
+    --input: 217 21% 22%;
+    --ring: 199 89% 58%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    background-image:
+      radial-gradient(circle at 10% 10%, rgba(28, 120, 255, 0.08), transparent 40%),
+      radial-gradient(circle at 85% 5%, rgba(7, 204, 187, 0.08), transparent 30%),
+      radial-gradient(circle at 50% 100%, rgba(16, 185, 129, 0.06), transparent 45%);
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-card/80 backdrop-blur-sm border shadow-sm;
+  }
+}
